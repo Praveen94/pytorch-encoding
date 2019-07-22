@@ -1,4 +1,4 @@
-Reffered from [tjulyz](https://github.com/tjulyz/PyTorch-Encoding)
+Referred from [tjulyz](https://github.com/tjulyz/PyTorch-Encoding)
 
 MANY TIMES!
 
