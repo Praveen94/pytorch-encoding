@@ -20,7 +20,7 @@ from torch.nn.parallel._functions import ReduceAddCoalesced, Broadcast
 
 torch_ver = torch.__version__[:3]
 
-__all__ = ['allreduce', 'DataParallelModel', 'DataParallelCriterion',
+__all__ = ['allreduce', 'DataParallelModel', 'DataParallelCriterion','DataParallelAccuracyMetric',
            'patch_replication_callback']
 
 def allreduce(*inputs):
@@ -181,6 +181,81 @@ def _criterion_parallel_apply(modules, inputs, targets, kwargs_tup=None, devices
 
     outputs = []
     for i in range(len(inputs)):
+        output = results[i]
+        if isinstance(output, Exception):
+            raise output
+        outputs.append(output)
+    return outputs
+
+
+class DataParallelAccuracyMetric(DataParallel):
+    def forward(self, inputs1, targets1, inputs2, targets2, **kwargs):
+        # input should be already scatterd
+        # scattering the targets instead
+        if not self.device_ids:
+            return self.module(inputs1, targets1, inputs2, targets2, **kwargs)
+        targets1, targets2, kwargs = self.scatter(
+            targets1, targets2, kwargs, self.device_ids)
+        if len(self.device_ids) == 1:
+            return self.module(inputs1, targets1[0], inputs2, targets2[0], **kwargs[0])
+        replicas = self.replicate(self.module, self.device_ids[:len(inputs1)])
+        target1 = tuple(targets_per_gpu[0] for targets_per_gpu in targets1)
+        target2 = tuple(targets_per_gpu[0] for targets_per_gpu in targets2)
+        outputs = _accuracy_metric_parallel_apply(
+            replicas, inputs1, targets1, inputs2, targets2, kwargs)
+        return Reduce.apply(*outputs) / len(outputs)
+
+
+def _accuracy_metric_parallel_apply(modules, inputs1, targets1, inputs2, targets2, kwargs_tup=None, devices=None):
+    assert len(inputs1) == len(inputs2)
+    assert len(modules) == len(inputs1)
+    assert len(targets1) == len(targets2)
+    assert len(targets1) == len(inputs1)
+    if kwargs_tup:
+        assert len(modules) == len(kwargs_tup)
+    else:
+        kwargs_tup = ({},) * len(modules)
+    if devices is not None:
+        assert len(modules) == len(devices)
+    else:
+        devices = [None] * len(modules)
+
+    lock = threading.Lock()
+    results = {}
+    if torch_ver != "0.3":
+        grad_enabled = torch.is_grad_enabled()
+
+    def _accuracy_worker(i, module, input1, target1, input2, target2, kwargs, device=None):
+        if torch_ver != "0.3":
+            torch.set_grad_enabled(grad_enabled)
+        if device is None:
+            device = get_a_var([input1, input2]).get_device()
+        try:
+            with torch.cuda.device(device):
+                output = module(input1, target1, input2, target2)
+            with lock:
+                results[i] = output
+        except Exception as e:
+            with lock:
+                results[i] = e
+
+    if len(modules) > 1:
+        threads = [threading.Thread(target=_accuracy_worker,
+                                    args=(i, module, input1, target1, input2, target2,
+                                          kwargs, device),)
+                   for i, (module, input1, target1, input2, target2, kwargs, device) in
+                   enumerate(zip(modules, inputs1, targets1, inputs2, targets2, kwargs_tup, devices))]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    else:
+        _accuracy_worker(0, modules[0], inputs1[0], input2=inputs2[0],
+                         kwargs=kwargs_tup[0], device=devices[0])
+
+    outputs = []
+    for i in range(len(inputs1)):
         output = results[i]
         if isinstance(output, Exception):
             raise output
